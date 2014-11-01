@@ -1,0 +1,35 @@
+# Copyright 2014 by Cloudsoft Corporation Limited
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+id: simple-java-application
+name: Simple Java Appplication
+origin: https://github.com/cloudsoft/brooklyn-waratek/
+locations:
+ - waratek-infrastructure
+services:
+ - serviceType: brooklyn.entity.waratek.WaratekApplicationCluster
+   id: waratek-helloworld-application
+   name: Waratek HelloWorld Application
+   brooklyn.config:
+     dynamiccluster.zone.enable: true
+     dynamiccluster.zone.placementStrategy: "brooklyn.entity.waratek.cloudvm.WaratekNodePlacementStrategy"
+     initialSize: 6
+     memberSpec:
+       $brooklyn:entitySpec:
+         type: brooklyn.entity.waratek.WaratekJavaApplication
+         brooklyn.config:
+           waratek.jvc.maxHeapSize: 200000000
+           args: "1024"
+           mainClass: "com.example.HelloWorld"
+           classpath: brooklyn-waratek-examples.jar
