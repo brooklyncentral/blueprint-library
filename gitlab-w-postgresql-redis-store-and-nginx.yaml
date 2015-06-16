@@ -1,0 +1,227 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+
+# Be aware that Gitlab instance and Nginx server require a Debian based Linux environment.
+# The blueprint enforce this by setting the provisioning.properties for the Gitlab node.
+id: gitlab-w-postgres-redis-sotre-and-nginx
+name: Gitlab with PostgreSQL, Redis store and Nginx
+origin: https://gitlab.com
+brooklyn.config:
+  gitlab.version: 7-11-stable
+  gitlab.email.from: gitlab@brooklyn.local
+  gitlab.email.display_name: GitLab powered by Brooklyn
+  gitlab.email.reply_to: gitlab@brooklyn.local
+  gitlab.db.username: git
+  gitlab.db.password: passw0rd
+  gitlab.db.database: gitlabhq_production
+  # Set the connect mode to "gitlab" to restrict TCP/IP connections from Gitlab instance only.
+  connect.mode: all
+
+services:
+  - type: brooklyn.entity.database.postgresql.PostgreSqlNode
+    id: postgresql
+    name: PostgreSQL Database
+    datastore.creation.script.contents: $brooklyn:formatString("CREATE USER %1$s WITH PASSWORD '%2$s' CREATEDB; CREATE DATABASE %3$s OWNER %1$s;",
+      config("gitlab.db.username"), config("gitlab.db.password"), config("gitlab.db.database"))
+    shell.env:
+      GITLAB_HOST: $brooklyn:component("gitlab").attributeWhenReady("host.address")
+      POSTGRESQL_HOME: $brooklyn:attributeWhenReady("install.dir")
+      POSTGRESQL_DATA: $brooklyn:attributeWhenReady("run.dir")
+      DB_USER: $brooklyn:config("gitlab.db.username")
+      DB_PASSWORD: $brooklyn:config("gitlab.db.password")
+      DB_DATABASE: $brooklyn:config("gitlab.db.database")
+    post.launch.command: |
+
+      if [ $brooklyn:config("connect.mode") == "gitlab" ]; then
+        # Allow only our Gitlab instance to connect to PostgreSQL by commenting
+        # the line with IP 0.0.0.0/0 and adding our own.
+        sudo su -c "sed -i 's/^\(.*0\.0\.0\.0.*\)$/#\1/g' $POSTGRESQL_DATA/data/pg_hba.conf"
+        sudo su -c "echo 'host $DB_DATABASE $DB_USER $GITLAB_HOST/32 md5' >> $POSTGRESQL_DATA/data/pg_hba.conf"
+
+        # Restart PostgreSQL
+        sudo -E -n -u postgres -s -- $POSTGRESQL_HOME/bin/pg_ctl -D $POSTGRESQL_DATA/data -l $POSTGRESQL_DATA/postgresql.log restart ;
+      fi
+
+  - type: brooklyn.entity.nosql.redis.RedisStore
+    id: redis
+    name: Redis Store
+
+  - type: brooklyn.entity.basic.SameServerEntity
+    id: node
+    name: Gitlab node
+    provisioning.properties:
+      osFamily: ubuntu
+    brooklyn.children:
+    - type: brooklyn.entity.basic.VanillaSoftwareProcess
+      id: nginx
+      name: Nginx server
+      install.latch: $brooklyn:component("gitlab").attributeWhenReady("service.isUp")
+      post.install.command: |
+
+        # Install Nginx
+        sudo apt-get -y install nginx
+
+        # Configure Nginx
+        sudo cp /home/git/gitlab/lib/support/nginx/gitlab /etc/nginx/sites-available/gitlab
+        sudo ln -s /etc/nginx/sites-available/gitlab /etc/nginx/sites-enabled/gitlab
+        sudo rm /etc/nginx/sites-enabled/default
+        sudo service nginx stop
+
+      launch.command: |
+
+        # Start Nginx server
+        sudo service nginx restart
+
+      checkRunning.command: |
+
+        # Launch check command
+        sudo nginx -t
+
+      stop.command: |
+
+        # Stop Nginx server
+        sudo service nginx stop
+
+    - type: brooklyn.entity.basic.VanillaSoftwareProcess
+      id: gitlab
+      name: Gitlab instance
+      # TODO: Add configuration for Gitlab instance like features to enable, themes, etc...
+      # TODO: Also add configuration to enable HTTPS
+      env:
+        REDIS_HOST: $brooklyn:formatString("redis://%s:%d", component("redis").attributeWhenReady("host.address"), component("redis").attributeWhenReady("redis.port"))
+        POSTGRESQL_HOST: $brooklyn:component("postgresql").attributeWhenReady("host.address")
+        POSTGRESQL_PORT: $brooklyn:component("postgresql").attributeWhenReady("postgresql.port")
+        GITLAB_VERSION: $brooklyn:config("gitlab.version")
+        EMAIL_FROM: $brooklyn:config("gitlab.email.from")
+        EMAIL_DISPLAY_NAME: $brooklyn:config("gitlab.email.display_name")
+        EMAIL_REPLY_TO: $brooklyn:config("gitlab.email.reply_to")
+        DB_USER: $brooklyn:config("gitlab.db.username")
+        DB_PASSWORD: $brooklyn:config("gitlab.db.password")
+        DB_DATABASE: $brooklyn:config("gitlab.db.database")
+      post.install.command: |
+
+        # Add git system user
+        sudo adduser --disabled-login --gecos 'GitLab' git
+
+        # Install required dependencies
+        sudo apt-get install -y libpq-dev build-essential zlib1g-dev libyaml-dev libssl-dev libgdbm-dev libreadline-dev libncurses5-dev libffi-dev curl openssh-server redis-server checkinstall libxml2-dev libxslt-dev libcurl4-openssl-dev libicu-dev logrotate python-docutils pkg-config cmake nodejs git-core postfix
+
+        # Install ruby > 2.0
+        sudo apt-get remove ruby1.8
+        mkdir /tmp/ruby && cd /tmp/ruby
+        curl -L --progress http://cache.ruby-lang.org/pub/ruby/2.1/ruby-2.1.6.tar.gz | tar xz
+        cd ruby-2.1.6
+        ./configure --disable-install-rdoc
+        make
+        sudo make install
+
+        # Install bundler gems
+        sudo gem install bundler --no-ri --no-rdoc
+
+        # Clone gitlab from source
+        cd /home/git
+        sudo -u git -H git clone https://gitlab.com/gitlab-org/gitlab-ce.git -b ${GITLAB_VERSION:-7-11-stable} gitlab
+
+        # Go to GitLab installation folder
+        cd /home/git/gitlab
+
+        # Copy the example GitLab config and modify it as per as our needs
+        sudo -u git -H cp config/gitlab.yml.example config/gitlab.yml
+        sudo sed -i "s/\(email_from:\).*$/\1 ${EMAIL_FROM:-gitlab@brooklyn.local}/g" config/gitlab.yml
+        sudo sed -i "s/\(email_display_name:\).*$/\1 ${EMAIL_DISPLAY_NAME:-Gitlab powered by Brooklyn}/g" config/gitlab.yml
+        sudo sed -i "s/\(email_reply_to:\).*$/\1 ${EMAIL_REPLY_TO:-gitlab@brooklyn.local}/g" config/gitlab.yml
+
+        # Make sure GitLab can write to the log/ and tmp/ directories
+        sudo chown -R git log/
+        sudo chown -R git tmp/
+        sudo chmod -R u+rwX,go-w log/
+        sudo chmod -R u+rwX tmp/
+
+        # Create directory for satellites
+        sudo -u git -H mkdir /home/git/gitlab-satellites
+        sudo chmod u+rwx,g=rx,o-rwx /home/git/gitlab-satellites
+
+        # Make sure GitLab can write to the tmp/pids/ and tmp/sockets/ directories
+        sudo chmod -R u+rwX tmp/pids/
+        sudo chmod -R u+rwX tmp/sockets/
+
+        # Make sure GitLab can write to the public/uploads/ directory
+        sudo chmod -R u+rwX  public/uploads
+
+        # Copy the example Unicorn config
+        # TODO: Should ready the number of core, etc to customize the unicorn configuration
+        sudo -u git -H cp config/unicorn.rb.example config/unicorn.rb
+
+        # Copy the example Rack attack config
+        sudo -u git -H cp config/initializers/rack_attack.rb.example config/initializers/rack_attack.rb
+
+        # Configure Git global settings for git user, used when editing via web editor
+        sudo -u git -H git config --global core.autocrlf input
+
+        # Configure Redis connection settings
+        sudo -u git -H cp config/resque.yml.example config/resque.yml
+        sudo sed -i "s|\(production:\).*$|\1 $REDIS_HOST|g" config/resque.yml
+
+        # Configure database connection settings
+        sudo -u git -H cp config/database.yml.postgresql config/database.yml
+        sudo sed -i "1,/username:/s/^.*\(username:\).*$/  \1 $DB_USER/g" config/database.yml
+        sudo sed -i "1,/password:/s/^.*\(password:\).*$/  \1 $DB_PASSWORD/g" config/database.yml
+        sudo sed -i "1,/host:/s/^.*\(host:\).*$/  \1 $POSTGRESQL_HOST/g" config/database.yml
+        sudo sed -i "1,/port:/s/^.*\(port:\).*$/  \1 $POSTGRESQL_PORT/g" config/database.yml
+        # Make config/database.yml readable to git only
+        sudo -u git -H chmod o-rwx config/database.yml
+
+        # Install gems
+        sudo -u git -H bundle install --deployment --without development test mysql aws kerberos
+
+        # Install Gitlab shell
+        sudo -u git -H bundle exec rake gitlab:shell:install[v2.6.3] REDIS_URL=$REDIS_HOST RAILS_ENV=production
+
+        # Initialize Database and Activate Advanced Features
+        sudo -u git -H bundle exec rake gitlab:setup RAILS_ENV=production <<< "yes"
+
+        # Install Init Script
+        sudo cp lib/support/init.d/gitlab /etc/init.d/gitlab
+        sudo cp lib/support/init.d/gitlab.default.example /etc/default/gitlab
+        sudo update-rc.d gitlab defaults 21
+
+        # Setup Logrotate
+        sudo cp lib/support/logrotate/gitlab /etc/logrotate.d/gitlab
+
+        # Compile Assets
+        sudo -u git -H bundle exec rake assets:precompile RAILS_ENV=production
+
+      launch.command: |
+
+        # Start GitLab instance
+        sudo service gitlab start
+
+      checkRunning.command: |
+
+        # Go back to the root install directory
+        cd /home/git/gitlab
+        # Launch the check command
+        sudo -u git -H bundle exec rake gitlab:check RAILS_ENV=production
+
+      stop.command: |
+
+        # Stop Gitlab instance
+        sudo service gitlab stop
+
+      # TODO: Add sensors like: Gitlab URL, number of users / repository, etc.
