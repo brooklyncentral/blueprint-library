@@ -12,23 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-id: tomcat-application
-name: "Tomcat Web Application"
-origin: "http://brooklyncentral.github.io/clocker/"
+id: docker-mysql
+name: "Docker Hub MySQL Service"
+origin: "https://registry.hub.docker.com/_/mysql/"
 locations:
 - my-docker-cloud
 
 services:
-- serviceType: brooklyn.entity.webapp.tomcat.TomcatServer
-  brooklyn.config:
-    docker.dockerfile.url:
-      "https://s3-eu-west-1.amazonaws.com/brooklyn-clocker/UsesJavaDockerfile"
-    docker.host.volumes:
-      "https://s3-eu-west-1.amazonaws.com/brooklyn-clocker/static.tgz": "/opt/www"
-      "/tmp": "/opt/tmp"
-    wars.root:
-      "https://s3-eu-west-1.amazonaws.com/brooklyn-clocker/hello-world.war"
-    version: "7.0.53"
-    jmx.enabled: true
-    jmx.agent.mode: "JMXMP"
-    jmx.direct.port: "30000+"
+- type: docker:mysql:5.7
+  openPorts:
+  - 3306
+  directPorts:
+  - 3306
+  env:
+    MYSQL_ROOT_PASSWORD: "s3cr3t"
