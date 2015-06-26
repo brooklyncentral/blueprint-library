@@ -67,15 +67,26 @@ services:
     name: Gitlab node
     provisioning.properties:
       osFamily: ubuntu
+      minRam: 2048mb
+      minCores: 2
+    # and add an enricher at the root node so all sensors from gitlab are visible
+    brooklyn.enrichers:
+    - enricherType: brooklyn.enricher.basic.Propagator
+      brooklyn.config:
+        enricher.producer: $brooklyn:component("gitlab")
+        enricher.propagating.propagatingAll: true
     brooklyn.children:
     - type: brooklyn.entity.basic.VanillaSoftwareProcess
       id: nginx
       name: Nginx server
+      version: 2
       install.latch: $brooklyn:component("gitlab").attributeWhenReady("service.isUp")
-      post.install.command: |
+      install.command: |
 
         # Install Nginx
         sudo apt-get -y install nginx
+
+      customize.command: |
 
         # Configure Nginx
         sudo cp /home/git/gitlab/lib/support/nginx/gitlab /etc/nginx/sites-available/gitlab
@@ -86,7 +97,7 @@ services:
       launch.command: |
 
         # Start Nginx server
-        sudo service nginx restart
+        sudo service nginx start
 
       checkRunning.command: |
 
@@ -101,12 +112,15 @@ services:
     - type: brooklyn.entity.basic.VanillaSoftwareProcess
       id: gitlab
       name: Gitlab instance
+      version: 1
       # TODO: Add configuration for Gitlab instance like features to enable, themes, etc...
       # TODO: Also add configuration to enable HTTPS
       env:
         REDIS_HOST: $brooklyn:formatString("redis://%s:%d", component("redis").attributeWhenReady("host.address"), component("redis").attributeWhenReady("redis.port"))
         POSTGRESQL_HOST: $brooklyn:component("postgresql").attributeWhenReady("host.address")
         POSTGRESQL_PORT: $brooklyn:component("postgresql").attributeWhenReady("postgresql.port")
+        MAIL_HOST: $brooklyn.attributeWhenReady("host.address")
+        GITLAB_HOST: $brooklyn:formatString("http://%s", component("nginx").attributeWhenReady("host.address"))
         GITLAB_VERSION: $brooklyn:config("gitlab.version")
         EMAIL_FROM: $brooklyn:config("gitlab.email.from")
         EMAIL_DISPLAY_NAME: $brooklyn:config("gitlab.email.display_name")
@@ -114,14 +128,19 @@ services:
         DB_USER: $brooklyn:config("gitlab.db.username")
         DB_PASSWORD: $brooklyn:config("gitlab.db.password")
         DB_DATABASE: $brooklyn:config("gitlab.db.database")
-      post.install.command: |
+      install.command: |
 
         # Add git system user
         sudo adduser --disabled-login --gecos 'GitLab' git
 
         # Install required dependencies
-        sudo apt-get install -y libpq-dev build-essential zlib1g-dev libyaml-dev libssl-dev libgdbm-dev libreadline-dev libncurses5-dev libffi-dev curl openssh-server redis-server checkinstall libxml2-dev libxslt-dev libcurl4-openssl-dev libicu-dev logrotate python-docutils pkg-config cmake nodejs git-core postfix
-
+        sudo apt-get update -y
+        sudo apt-get upgrade -y
+        sudo apt-get install -y libpq-dev build-essential zlib1g-dev libyaml-dev libssl-dev libgdbm-dev libreadline-dev libncurses5-dev libffi-dev curl openssh-server redis-server checkinstall libxml2-dev libxslt-dev libcurl4-openssl-dev libicu-dev logrotate python-docutils pkg-config cmake nodejs git-core postgresql-client jq
+        # Install postfix
+        sudo debconf-set-selections <<< "postfix postfix/mailname string $MAIL_HOST"
+        sudo debconf-set-selections <<< "postfix postfix/main_mailer_type string 'Internet Site'"
+        sudo apt-get install -y postfix
         # Install ruby > 2.0
         sudo apt-get remove ruby1.8
         mkdir /tmp/ruby && cd /tmp/ruby
@@ -165,8 +184,8 @@ services:
         sudo chmod -R u+rwX  public/uploads
 
         # Copy the example Unicorn config
-        # TODO: Should ready the number of core, etc to customize the unicorn configuration
         sudo -u git -H cp config/unicorn.rb.example config/unicorn.rb
+        sudo sed -i "s/\(worker_processes\) [0-9]$/\1 $(($(nproc)+1))/g" config/unicorn.rb
 
         # Copy the example Rack attack config
         sudo -u git -H cp config/initializers/rack_attack.rb.example config/initializers/rack_attack.rb
@@ -188,7 +207,7 @@ services:
         sudo -u git -H chmod o-rwx config/database.yml
 
         # Install gems
-        sudo -u git -H bundle install --deployment --without development test mysql aws kerberos
+        sudo -u git -H bundle install -j$(nproc) --deployment --without development test mysql aws kerberos
 
         # Install Gitlab shell
         sudo -u git -H bundle exec rake gitlab:shell:install[v2.6.3] REDIS_URL=$REDIS_HOST RAILS_ENV=production
@@ -207,6 +226,19 @@ services:
         # Compile Assets
         sudo -u git -H bundle exec rake assets:precompile RAILS_ENV=production
 
+      customize.command: |
+
+        # Create .pgpass file for postgresql connections
+        echo "$POSTGRESQL_HOST:$POSTGRESQL_PORT:$DB_DATABASE:$DB_USER:$DB_PASSWORD" > ~/.pgpass
+        chmod 600 ~/.pgpass
+
+        # Create retrieve_private_token.sh file for sensors
+        cat > ~/retrieve_private_token.sh <<- EOF
+        #!/bin/bash
+        psql -h $POSTGRESQL_HOST -p $POSTGRESQL_PORT -U $DB_USER $DB_DATABASE -c "COPY (SELECT authentication_token FROM USERS where admin = true LIMIT 1) TO STDOUT WITH CSV"
+        EOF
+        chmod +x ~/retrieve_private_token.sh
+
       launch.command: |
 
         # Start GitLab instance
@@ -224,4 +256,97 @@ services:
         # Stop Gitlab instance
         sudo service gitlab stop
 
-      # TODO: Add sensors like: Gitlab URL, number of users / repository, etc.
+      brooklyn.initializers:
+      - type: brooklyn.entity.software.ssh.SshCommandEffector
+        brooklyn.config:
+          name: rebuildAuthorizedKeys
+          description: Rebuild the authorized_keys file
+          executionDir: /home/git/gitlab
+          command: sudo -u git -H bundle exec rake gitlab:shell:setup RAILS_ENV=production <<< 'yes'
+
+      - type: brooklyn.entity.software.ssh.SshCommandEffector
+        brooklyn.config:
+          name: clearRedisCache
+          description: Clear the redis cache. Invoke this effector only if the dashboard is showing wrong information
+          executionDir: /home/git/gitlab
+          command: sudo -u git -H bundle exec rake cache:clear RAILS_ENV=production
+
+      - type: brooklyn.entity.software.ssh.SshCommandEffector
+        brooklyn.config:
+          name: precompileAssets
+          description: Precompile assets. Invoke this effector if CSS is wrong after an upgrade
+          executionDir: /home/git/gitlab
+          command: sudo -u git -H bundle exec rake assets:precompile RAILS_ENV=production
+
+      - type: brooklyn.entity.software.ssh.SshCommandEffector
+        brooklyn.config:
+          name: removeOrphanNamespaces
+          description: Remove namespaces (dirs) from /home/git/repositories if they don't exist in GitLab database
+          executionDir: /home/git/gitlab
+          command: sudo -u git -H bundle exec rake gitlab:cleanup:dirs RAILS_ENV=production REMOVE=true
+
+      - type: brooklyn.entity.software.ssh.SshCommandEffector
+        brooklyn.config:
+          name: removeOrphanRepositories
+          description: Remove repositories (global only for now) from /home/git/repositories if they don't exist in GitLab database
+          executionDir: /home/git/gitlab
+          command: sudo -u git -H bundle exec rake gitlab:cleanup:repos RAILS_ENV=production REMOVE=true
+
+      - type: brooklyn.entity.software.ssh.SshCommandSensor
+        brooklyn.config:
+          name: gitlab.private_token
+          command: sh ~/retrieve_private_token.sh
+
+      - type: brooklyn.entity.software.ssh.SshCommandSensor
+        brooklyn.config:
+          name: gitlab.url
+          command: echo $GITLAB_HOST
+          period: 30s
+
+      - type: brooklyn.entity.software.ssh.SshCommandSensor
+        brooklyn.config:
+          name: gitlab.users
+          command: 'curl -H "PRIVATE-TOKEN: $(sh ~/retrieve_private_token.sh)" -s http://localhost/api/v3/users'
+          period: 30s
+
+      - type: brooklyn.entity.software.ssh.SshCommandSensor
+        brooklyn.config:
+          name: gitlab.users.length
+          command: 'curl -H "PRIVATE-TOKEN: $(sh ~/retrieve_private_token.sh)" -s http://localhost/api/v3/users | jq "length"'
+          period: 30s
+
+      - type: brooklyn.entity.software.ssh.SshCommandSensor
+        brooklyn.config:
+          name: gitlab.projects
+          command: 'curl -H "PRIVATE-TOKEN: $(sh ~/retrieve_private_token.sh)" -s http://localhost/api/v3/projects'
+          period: 30s
+
+      - type: brooklyn.entity.software.ssh.SshCommandSensor
+        brooklyn.config:
+          name: gitlab.projects.length
+          command: 'curl -H "PRIVATE-TOKEN: $(sh ~/retrieve_private_token.sh)" -s http://localhost/api/v3/projects | jq "length"'
+          period: 30s
+
+      - type: brooklyn.entity.software.ssh.SshCommandSensor
+        brooklyn.config:
+          name: gitlab.groups
+          command: 'curl -H "PRIVATE-TOKEN: $(sh ~/retrieve_private_token.sh)" -s http://localhost/api/v3/groups'
+          period: 30s
+
+      - type: brooklyn.entity.software.ssh.SshCommandSensor
+        brooklyn.config:
+          name: gitlab.groups.length
+          command: 'curl -H "PRIVATE-TOKEN: $(sh ~/retrieve_private_token.sh)" -s http://localhost/api/v3/groups | jq "length"'
+          period: 30s
+
+      - type: brooklyn.entity.software.ssh.SshCommandSensor
+        brooklyn.config:
+          name: gitlab.namespaces
+          command: 'curl -H "PRIVATE-TOKEN: $(sh ~/retrieve_private_token.sh)" -s http://localhost/api/v3/namespaces'
+          period: 30s
+
+      - type: brooklyn.entity.software.ssh.SshCommandSensor
+        brooklyn.config:
+          name: gitlab.namespaces.length
+          command: 'curl -H "PRIVATE-TOKEN: $(sh ~/retrieve_private_token.sh)" -s http://localhost/api/v3/namespaces | jq "length"'
+          period: 30s
