@@ -1,4 +1,4 @@
-# Copyright 2014 by Cloudsoft Corporation Limited
+# Copyright 2014-2015 by Cloudsoft Corporation Limited
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,11 +14,12 @@
 
 id: tomcat-cluster-with-mysql
 name: "Tomcat Application Server Cluster with MySQL Database"
-origin: "http://brooklyncentral.github.io/"
+origin: "https://github.com/apache/incubator-brooklyn/"
 locations:
 - my-docker-cloud
+
 services:
-- serviceType: brooklyn.entity.webapp.ControlledDynamicWebAppCluster
+- type: brooklyn.entity.webapp.ControlledDynamicWebAppCluster
   id: tomcat-cluster
   name: "Tomcat Cluster"
   brooklyn.config:
@@ -29,8 +30,9 @@ services:
     proxy.http.port: "8000+"
     java.sysprops:
       brooklyn.example.db.url: >
-        $brooklyn:formatString("jdbc:%s%s?user=%s&password=%s",
-        component("mysql").attributeWhenReady("mapped.datastore.url"),
+        $brooklyn:formatString("jdbc:mysql://%s:%s/%s?user=%s&password=%s",
+        component("mysql").attributeWhenReady("host.subnet.address"),
+        component("mysql").attributeWhenReady("mysql.port"),
         "visitors", "brooklyn", "br00k11n")
     memberSpec:
       $brooklyn:entitySpec:
@@ -46,16 +48,17 @@ services:
     controlleddynamicwebappcluster.webClusterSpec:
       $brooklyn:entitySpec:
         type: brooklyn.entity.webapp.DynamicWebAppCluster
-        brooklyn.config:
-          dynamiccluster.zone.enable: true
-          dynamiccluster.zone.placementStrategy:
-            brooklyn.location.docker.strategy.BreadthFirstPlacementStrategy
     controlleddynamicwebappcluster.controllerSpec:
       $brooklyn:entitySpec:
-        type: brooklyn.entity.proxy.nginx.NginxController
+        type: brooklyn.entity.proxy.haproxy.HAProxyController
         brooklyn.config:
-          member.sensor.hostandport: "mapped.http.port"
-- serviceType: brooklyn.entity.database.mysql.MySqlNode
+          docker.image.name: haproxy
+          docker.image.tag: latest
+          install.dir: /usr/local/sbin/
+          run.dir: /usr/local/etc/haproxy/
+          member.sensor.hostname: "host.subnet.hostname"
+
+- type: brooklyn.entity.database.mysql.MySqlNode
   id: mysql
   name: MySQL Database
   brooklyn.config:

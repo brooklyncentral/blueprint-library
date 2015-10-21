@@ -1,4 +1,4 @@
-# Copyright 2014 by Cloudsoft Corporation Limited
+# Copyright 2014-2015 by Cloudsoft Corporation Limited
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,9 +14,10 @@
 
 id: tomcat-application
 name: "Tomcat Web Application"
-origin: "http://brooklyncentral.github.io/"
+origin: "https://github.com/apache/incubator-brooklyn/"
 locations:
 - my-docker-cloud
+
 services:
 - serviceType: brooklyn.entity.webapp.tomcat.TomcatServer
   brooklyn.config:
