@@ -1,0 +1,25 @@
+name: elk
+description: |
+       Simple ELK stack deployment: it installs ES, Kibana and lostash as a child of Apache Tomcat 8
+services:
+- type: org.apache.brooklyn.entity.nosql.elasticsearch.ElasticSearchNode
+  id: es
+  name: elasticsearch
+  brooklyn.config:
+    install.version: 1.4.4
+- type: kibana-standalone
+  id: kibana
+  name: kibana
+  install.latch: $brooklyn:component("es").attributeWhenReady("service.isUp")
+  brooklyn.config:
+    kibana.elasticsearch.ip: $brooklyn:entity("es").attributeWhenReady("host.address")
+
+- type: org.apache.brooklyn.entity.webapp.tomcat.Tomcat8Server
+  id: tomcat8
+  brooklyn.config:
+    children.startable.mode: background_late
+  brooklyn.children:
+  - type: logstash-child
+    name: logstash-child
+    brooklyn.config:
+      logstash.elasticsearch.ip: $brooklyn:entity("es").attributeWhenReady("host.address")
